@@ -1,20 +1,20 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from transformers import RobertaTokenizer, RobertaModel, Wav2Vec2Processor
-from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Model, Wav2Vec2PreTrainedModel
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from transformers import RobertaTokenizer, RobertaModel, Wav2Vec2Processor, Wav2Vec2Model, Wav2Vec2Config
+from transformers import BertConfig
 import torchaudio
 import numpy as np
-from iemocap_dataloader import *
+from pre_processor import *
 from multi_modality_fusion import *
 from tqdm import tqdm
 import random
-import torch.nn.functional as F
 import os
-import copy  # 导入deepcopy
+import copy
 
-
-# 设置随机种子
+# Set random seed
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -22,14 +22,15 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
 set_seed(42)
 
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 定义投影头
-class ProjectionHead(nn.Module):
+# Define single modality projection heads
+class AudioProjectionHead(nn.Module):
     def __init__(self, input_dim, output_dim):
-        super(ProjectionHead, self).__init__()
+        super(AudioProjectionHead, self).__init__()
         self.fc1 = nn.Linear(input_dim, input_dim)
         self.fc2 = nn.Linear(input_dim, output_dim)
 
@@ -39,30 +40,38 @@ class ProjectionHead(nn.Module):
         x = self.fc2(x)
         return x
 
+class TextProjectionHead(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(TextProjectionHead, self).__init__()
+        self.fc1 = nn.Linear(input_dim, input_dim)
+        self.fc2 = nn.Linear(input_dim, output_dim)
 
-# 定义带有可学习温度系数的模型
+    def forward(self, x):
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.fc2(x)
+        return x
+
+# Define temperature model
 class TemperatureModel(nn.Module):
     def __init__(self, initial_temp=1.0):
         super(TemperatureModel, self).__init__()
         self.temperature = nn.Parameter(torch.tensor(initial_temp))
 
     def forward(self):
-        return torch.sigmoid(self.temperature)  # 将温度系数限制在0到1之间
+        return torch.sigmoid(self.temperature)  # Limit temperature between 0 and 1
 
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 temperature_model_init = TemperatureModel().to(device)
 
-# RoBERTa 配置
+# RoBERTa configuration
 roberta_tokenizer = RobertaTokenizer.from_pretrained('../roberta-large-uncased')
 roberta_model_init = RobertaModel.from_pretrained('../roberta-large-uncased').to(device)
 
-
-# 获取文本向量全局和序列向量
-class Get_TextEmbedding(nn.Module):
-    def __init__(self, roberta_tokenizer, text_model):
-        super(Get_TextEmbedding, self).__init__()
-        self.tokenizer = roberta_tokenizer
+# Get text embeddings
+class GetTextEmbedding(nn.Module):
+    def __init__(self, tokenizer, text_model):
+        super(GetTextEmbedding, self).__init__()
+        self.tokenizer = tokenizer
         self.text_model = text_model
 
     def forward(self, text_inputs):
@@ -72,12 +81,11 @@ class Get_TextEmbedding(nn.Module):
         text_seq_embedding, text_cls_embeddings = text_output[0], text_output[1]
         return text_seq_embedding, text_cls_embeddings
 
-
-# 创建情感预测模型
+# Instantiate models
 num_labels = 4
-hidden_size = roberta_model_init.config.hidden_size
-TextEmbedding_model_init = Get_TextEmbedding(roberta_tokenizer, roberta_model_init).to(device)
+TextEmbedding_model_init = GetTextEmbedding(roberta_tokenizer, roberta_model_init).to(device)
 
+# Initialize multimodal fusion model
 bert_config = BertConfig(
     hidden_size=1024,
     num_hidden_layers=6,
@@ -86,17 +94,77 @@ bert_config = BertConfig(
     max_position_embeddings=2800,
     num_labels=4
 )
+Bert_adapter_multimodel_fusion_init = MultimodalBertModel(bert_config).to(device)
 
-Bert_adapter_multimodel_fusion_init = MultimodalBertModel(bert_config)
-projection_head_init = ProjectionHead(input_dim=1024, output_dim=1024).to(device)
+# Initialize projection heads
+audio_projection_head_init = AudioProjectionHead(input_dim=1024, output_dim=1024).to(device)
+text_projection_head_init = TextProjectionHead(input_dim=roberta_model_init.config.hidden_size, output_dim=1024).to(device)
 
+# Initialize loss function
 classification_criterion = nn.CrossEntropyLoss()
 
+# Define contrastive loss function
+def nt_xent_loss(embeddings1, embeddings2, temperature):
+    batch_size = embeddings1.size(0)
+    device = embeddings1.device
+    # Normalize embeddings
+    embeddings1 = F.normalize(embeddings1, dim=1)
+    embeddings2 = F.normalize(embeddings2, dim=1)
+    # Concatenate embeddings
+    embeddings = torch.cat([embeddings1, embeddings2], dim=0)  # [2*batch_size, dim]
+    # Compute similarity matrix
+    similarity_matrix = torch.matmul(embeddings, embeddings.t())  # [2*batch_size, 2*batch_size]
+    # Remove self-similarity
+    mask = torch.eye(2 * batch_size).bool().to(device)
+    similarity_matrix = similarity_matrix.masked_fill(mask, -9e15)
+    # Create labels for positive pairs
+    labels = torch.cat([torch.arange(batch_size, 2 * batch_size), torch.arange(batch_size)]).to(device)
+    # Similarity divided by temperature
+    similarity_matrix = similarity_matrix / temperature
+    # Cross-entropy loss
+    loss = F.cross_entropy(similarity_matrix, labels)
+    return loss
 
-def evaluate_model(model1, model2, dataloader):
-    model1.eval()
-    model2.eval()
-    temperature_model_init.eval()
+
+# 模态间对比学习损失（NCE）
+def modal_nt_xent_loss(audio_embeddings, text_embeddings, temperature):
+    batch_size = audio_embeddings.size(0)
+    device = audio_embeddings.device
+
+    # Normalize embeddings
+    audio_embeddings = F.normalize(audio_embeddings, dim=1)
+    text_embeddings = F.normalize(text_embeddings, dim=1)
+
+    # Similarity matrix between audio and text
+    similarity_matrix = torch.matmul(audio_embeddings, text_embeddings.t())  # [batch_size, batch_size]
+
+    # Similarity divided by temperature
+    similarity_matrix = similarity_matrix / temperature
+
+    # Create labels (positive pairs are diagonal elements)
+    labels = torch.arange(batch_size).to(device)
+
+    # Cross-entropy loss
+    loss = F.cross_entropy(similarity_matrix, labels)
+    return loss
+
+def create_binary_classification_pairs(audio_embeddings, text_embeddings, labels):
+    pairs = []
+    pair_labels = []
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            if i != j:
+                pairs.append((audio_embeddings[i], text_embeddings[j]))
+                pair_labels.append(1 if labels[i] == labels[j] else 0)
+    return pairs, pair_labels
+
+# Evaluate model function
+def evaluate_model(text_model, audio_model, fusion_model, dataloader):
+    text_model.eval()
+    audio_model.eval()
+    fusion_model.eval()
+    audio_projection_head_init.eval()
+    text_projection_head_init.eval()
     correct_predictions = 0
     total_predictions = 0
     total_loss = 0
@@ -104,36 +172,35 @@ def evaluate_model(model1, model2, dataloader):
     class_total = np.zeros(num_labels)
     with torch.no_grad():
         for batch in dataloader:
-            raw_audio_seq_input_padded, aug_audio_seq_input_padded, raw_audio_cls_input, aug_audio_cls_input, \
-            raw_audio_attention_masks, aug_audio_attention_masks, raw_audio_dimension, aug_audio_dimension, \
-            raw_text, aug_text, labels = batch['raw_audio_seq_input_padded'], batch['aug_audio_seq_input_padded'], \
-                                         batch['raw_audio_cls_input'], \
-                                         batch['aug_audio_cls_input'], batch['raw_audio_attention_masks'], batch[
-                                             'aug_audio_attention_masks'], \
-                                         batch['raw_audio_dimension'], batch['aug_audio_dimension'], batch['raw_text'], \
-                                         batch['aug_text'], batch['label']
+            raw_audio_input_ids, raw_attention_masks, aug_audio_input_ids, aug_attention_masks, \
+            raw_audio_dimensions, aug_audio_dimensions, raw_text, aug_text, labels = batch['raw_audio_input_ids'], \
+                                                                                     batch['raw_attention_masks'], \
+                                                                                     batch['aug_audio_input_ids'], \
+                                                                                     batch['aug_attention_masks'], \
+                                                                                     batch['raw_audio_dimensions'], \
+                                                                                     batch['aug_audio_dimensions'], \
+                                                                                     batch['raw_text'], batch['aug_text'], batch['label']
 
-            raw_audio_cls_embeddings = raw_audio_cls_input.to(device).squeeze(1)
-            aug_audio_cls_embeddings = aug_audio_cls_input.to(device).squeeze(1)
-            raw_audio_attention_masks = raw_audio_attention_masks.to(device)
-            aug_audio_attention_masks = aug_audio_attention_masks.to(device)
-            raw_audio_seq_embedding = raw_audio_seq_input_padded.to(device)
-            aug_audio_seq_embedding = aug_audio_seq_input_padded.to(device)
-            raw_text_seq_embedding, raw_text_cls_embeddings = model1(raw_text)
-            aug_text_seq_embedding, aug_text_cls_embeddings = model1(aug_text)
+            # Get embeddings
+            raw_text_seq_embedding, raw_text_cls_embeddings = text_model(raw_text)
+            raw_text_cls_embeddings = text_projection_head_init(raw_text_cls_embeddings)
 
-            attention_mask, token_type_ids = create_attention_mask_and_token_type_ids(raw_audio_seq_embedding,
-                                                                                      raw_audio_attention_masks,
-                                                                                      raw_text_seq_embedding,
-                                                                                      max_length=2800)
-            logits, _ = model2(raw_audio_seq_embedding, raw_text_seq_embedding, attention_mask, token_type_ids)
+            raw_audio_seq_embedding, raw_audio_cls_embeddings, _ = audio_model(raw_audio_input_ids, raw_attention_masks)
+            raw_audio_cls_embeddings = audio_projection_head_init(raw_audio_cls_embeddings)
+
+            # Fuse modalities and compute logits
+            logits, _,fusion_Cls = fusion_model(raw_audio_seq_embedding, raw_text_seq_embedding)
             predictions = torch.argmax(logits, dim=-1)
+
+            # Compute loss
             loss = classification_criterion(logits, labels.to(device))
             total_loss += loss.item()
 
+            # Compute accuracy
             correct_predictions += (predictions == labels.to(device)).sum().item()
             total_predictions += labels.size(0)
 
+            # Class-wise accuracy
             for i in range(len(labels)):
                 label = labels[i].item()
                 class_correct[label] += (predictions[i] == labels[i]).item()
@@ -141,271 +208,107 @@ def evaluate_model(model1, model2, dataloader):
 
     avg_loss = total_loss / total_predictions
     class_accuracy = class_correct / class_total
-    accuracy = (class_accuracy).mean()
+    accuracy = class_accuracy.mean()
     class_weights = class_total / total_predictions
     weighted_accuracy = (class_accuracy * class_weights).sum()
+
     return accuracy, avg_loss, weighted_accuracy, class_accuracy, class_weights
 
-
+# Training loop
 num_epochs = 30
 best_model_path = 'best_emotion_prediction_model.pth'
 best_accuracy = 0.0
-# 深拷贝初始化模型
-base_temperature_model = copy.deepcopy(temperature_model_init).to(device)
-base_roberta_model = copy.deepcopy(roberta_model_init).to(device)
-base_TextEmbedding_model = copy.deepcopy(TextEmbedding_model_init).to(device)
-base_Bert_adapter_multimodel_fusion = copy.deepcopy(Bert_adapter_multimodel_fusion_init).to(device)
-base_projection_head = copy.deepcopy(projection_head_init).to(device)
 
+# Deep copy initial models
+base_temperature_model = temperature_model_init.to(device)
+base_text_model = TextEmbedding_model_init.to(device)
+base_audio_model = audio_model.to(device)
+base_text_projection_head = text_projection_head_init.to(device)
+base_audio_projection_head = audio_projection_head_init.to(device)
+base_fusion_model = Bert_adapter_multimodel_fusion_init.to(device)
 
-# 循环训练每个 Session
-for session_id in range(2, 6):
+# Loop over sessions
+for session_id in range(1, 6):
     print(f"Training on Session {session_id}")
+    # Initialize models
     temperature_model_init.load_state_dict(base_temperature_model.state_dict())
-    roberta_model_init.load_state_dict(base_roberta_model.state_dict())
-    TextEmbedding_model_init.load_state_dict(base_TextEmbedding_model.state_dict())
-    Bert_adapter_multimodel_fusion_init.load_state_dict(base_Bert_adapter_multimodel_fusion.state_dict())
-    projection_head_init.load_state_dict(base_projection_head.state_dict())
+    TextEmbedding_model_init.load_state_dict(base_text_model.state_dict())
+    audio_model.load_state_dict(base_audio_model.state_dict())
+    text_projection_head_init.load_state_dict(base_text_projection_head.state_dict())
+    audio_projection_head_init.load_state_dict(base_audio_projection_head.state_dict())
+    Bert_adapter_multimodel_fusion_init.load_state_dict(base_fusion_model.state_dict())
 
     optimizer = torch.optim.Adam(
-        list(TextEmbedding_model_init.parameters()) + list(Bert_adapter_multimodel_fusion_init.parameters()) + list(
-            temperature_model_init.parameters()),
-        lr=1e-5
+        list(temperature_model_init.parameters()) + list(TextEmbedding_model_init.parameters()) + list(audio_model.parameters()) +
+        list(text_projection_head_init.parameters()) + list(audio_projection_head_init.parameters()) +
+        list(Bert_adapter_multimodel_fusion_init.parameters()), lr=1e-5
     )
 
-    train_dataset = IEMOCAPDataset(data_list_path=f'../dataset_session{session_id}/train_data.txt',
-                                   iemocap_aug_datapath='/home/wangchai/SpeechEmotion/FUXIAN_MMER2023/MMER-main/data/iemocap_aug/out/')
-    train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
-    val_dataset = IEMOCAPDataset(data_list_path=f'../dataset_session{session_id}/test_data.txt',
-                                 iemocap_aug_datapath='/home/wangchai/SpeechEmotion/FUXIAN_MMER2023/MMER-main/data/iemocap_aug/out/')
-    val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
+    train_dataset = IEMOCAPDataset('train_features_session5.pkl')
+    train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=collate_fn, drop_last=True)
+    val_dataset = IEMOCAPDataset('val_features_session5.pkl')
+    val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn, drop_last=True)
 
     for epoch in range(num_epochs):
-        TextEmbedding_model_init.train()
-        Bert_adapter_multimodel_fusion_init.train()
+        total_loss = 0
         temperature_model_init.train()
-
+        TextEmbedding_model_init.train()
+        audio_model.train()
+        text_projection_head_init.train()
+        audio_projection_head_init.train()
+        Bert_adapter_multimodel_fusion_init.train()
         for batch in tqdm(train_dataloader, desc=f"Session {session_id} Epoch {epoch + 1}/{num_epochs}"):
-            raw_audio_seq_input_padded, aug_audio_seq_input_padded, raw_audio_cls_input, aug_audio_cls_input, \
-            raw_audio_attention_masks, aug_audio_attention_masks, raw_audio_dimension, aug_audio_dimension, \
-            raw_text, aug_text, labels = batch['raw_audio_seq_input_padded'], batch['aug_audio_seq_input_padded'], \
-                                         batch['raw_audio_cls_input'], \
-                                         batch['aug_audio_cls_input'], batch['raw_audio_attention_masks'], batch[
-                                             'aug_audio_attention_masks'], \
-                                         batch['raw_audio_dimension'], batch['aug_audio_dimension'], batch['raw_text'], \
-                                         batch['aug_text'], batch['label']
-
-            raw_audio_cls_embeddings = raw_audio_cls_input.to(device).squeeze(1)
-            aug_audio_cls_embeddings = aug_audio_cls_input.to(device).squeeze(1)
-            raw_audio_dimension = raw_audio_dimension.to(device).squeeze(1)
-            aug_audio_dimension = aug_audio_dimension.to(device).squeeze(1)
-            raw_audio_attention_masks = raw_audio_attention_masks.to(device)
-            aug_audio_attention_masks = aug_audio_attention_masks.to(device)
-            raw_audio_seq_embedding = raw_audio_seq_input_padded.to(device)
-            aug_audio_seq_embedding = aug_audio_seq_input_padded.to(device)
+            raw_audio_input_ids, raw_attention_masks, aug_audio_input_ids, aug_attention_masks, \
+            raw_audio_dimensions, aug_audio_dimensions, raw_text, aug_text, labels = batch['raw_audio_input_ids'], batch['raw_attention_masks'], \
+                                                                                     batch['aug_audio_input_ids'], batch['aug_attention_masks'], \
+                                                                                     batch['raw_audio_dimensions'], batch['aug_audio_dimensions'], \
+                                                                                     batch['raw_text'], batch['aug_text'], batch['label']
+            optimizer.zero_grad()
+            # Get text embeddings
             raw_text_seq_embedding, raw_text_cls_embeddings = TextEmbedding_model_init(raw_text)
+
             aug_text_seq_embedding, aug_text_cls_embeddings = TextEmbedding_model_init(aug_text)
 
-            attention_mask, token_type_ids = create_attention_mask_and_token_type_ids(raw_audio_seq_embedding,
-                                                                                      raw_audio_attention_masks,
-                                                                                      raw_text_seq_embedding,
-                                                                                      max_length=2800)
-            logits1, _ = Bert_adapter_multimodel_fusion_init(raw_audio_seq_embedding, raw_text_seq_embedding, attention_mask,
-                                                        token_type_ids)
-            classification_loss1 = classification_criterion(logits1, labels.to(device))
+            raw_text_cls_embeddings = text_projection_head_init(raw_text_cls_embeddings)
+            aug_text_cls_embeddings = text_projection_head_init(aug_text_cls_embeddings)
 
-            classification_loss = classification_loss1
+            # Get audio embeddings
+            raw_audio_seq_embedding, raw_audio_cls_embeddings, _ = audio_model(raw_audio_input_ids, raw_attention_masks)
+            aug_audio_seq_embedding, aug_audio_cls_embeddings, _ = audio_model(aug_audio_input_ids, aug_attention_masks)
 
-            # 修改对比损失的计算过程，只对文本头进行映射
-            contrastive_loss = 0
-            temperature = temperature_model_init()  # 获取当前可学习的温度系数
+            raw_audio_cls_embeddings = audio_projection_head_init(raw_audio_cls_embeddings)
+            aug_audio_cls_embeddings = audio_projection_head_init(aug_audio_cls_embeddings)
 
-            for i in range(len(labels)):
-                anchor_audio_embedding = raw_audio_cls_embeddings[i]  # 不对语音头进行映射
-                anchor_text_embedding =  projection_head_init(raw_text_cls_embeddings[i])  # 只对文本头进行映射
-                anchor_label = labels[i]
-                anchor_dimension = raw_audio_dimension[i]
+            # Compute contrastive losses
+            temperature = temperature_model_init()
+            text_contrastive_loss = nt_xent_loss(raw_text_cls_embeddings, aug_text_cls_embeddings, temperature)
+            audio_contrastive_loss = nt_xent_loss(raw_audio_cls_embeddings, aug_audio_cls_embeddings, temperature)
+            # 计算模态间的对比损失 (NCE) - 原始音频与文本对之间的对比
+            modal_contrastive_loss = modal_nt_xent_loss(raw_audio_cls_embeddings, raw_text_cls_embeddings, temperature)
 
-                # 找出所有的正样本和负样本
-                positive_text_indices = (labels == anchor_label).nonzero(as_tuple=True)[0]
-                negative_text_indices = (labels != anchor_label).nonzero(as_tuple=True)[0]
-                positive_audio_indices = (labels == anchor_label).nonzero(as_tuple=True)[0]
-                negative_audio_indices = (labels != anchor_label).nonzero(as_tuple=True)[0]
-
-                positive_text_embeddings =  projection_head_init (raw_text_cls_embeddings[positive_text_indices])  # 只对文本头进行映射
-                positive_audio_embeddings = raw_audio_cls_embeddings[positive_audio_indices]  # 不对语音头进行映射
-                negative_text_embeddings =  projection_head_init (raw_text_cls_embeddings[negative_text_indices])  # 只对文本头进行映射
-                negative_audio_embeddings = raw_audio_cls_embeddings[negative_audio_indices]  # 不对语音头进行映射
-
-                # Audio anchor with Text
-                if len(positive_text_embeddings) > 1:
-                    pos_sim_text = torch.exp(
-                        F.cosine_similarity(anchor_audio_embedding.unsqueeze(0),
-                                            positive_text_embeddings) / temperature)
-                    neg_sim_text = torch.exp(
-                        F.cosine_similarity(anchor_audio_embedding.unsqueeze(0),
-                                            negative_text_embeddings) / temperature)
-                    neg_sim_audio = torch.exp(
-                        F.cosine_similarity(anchor_audio_embedding.unsqueeze(0),
-                                            negative_audio_embeddings) / temperature)
-
-                    # 计算正样本和负样本的权重
-                    pos_weights_text = torch.tensor(
-                        [F.cosine_similarity(anchor_dimension.unsqueeze(0), raw_audio_dimension[j].unsqueeze(0), dim=1)
-                         for j in positive_text_indices])
-                    pos_weights_text = 1.0 / (pos_weights_text + 1e-8)
-                    pos_weights_text = pos_weights_text / pos_weights_text.sum()
-
-                    neg_weights_text = torch.tensor(
-                        [F.cosine_similarity(anchor_dimension.unsqueeze(0), raw_audio_dimension[j].unsqueeze(0), dim=1)
-                         for j in negative_text_indices])
-                    neg_weights_text = neg_weights_text / neg_weights_text.sum()
-
-                    pos_sum_text = (pos_sim_text * pos_weights_text.to(device)).sum()
-                    neg_sum = (neg_sim_text * neg_weights_text.to(device)).sum() + neg_sim_audio.sum()
-                    contrastive_loss += -torch.log(pos_sum_text / (pos_sum_text + neg_sum))
-
-                # Text anchor with Audio
-                if len(positive_audio_embeddings) > 1:
-                    pos_sim_audio = torch.exp(
-                        F.cosine_similarity(anchor_text_embedding.unsqueeze(0),
-                                            positive_audio_embeddings) / temperature)
-                    neg_sim_audio = torch.exp(
-                        F.cosine_similarity(anchor_text_embedding.unsqueeze(0),
-                                            negative_audio_embeddings) / temperature)
-                    neg_sim_text = torch.exp(
-                        F.cosine_similarity(anchor_text_embedding.unsqueeze(0), negative_text_embeddings) / temperature)
-
-                    # 计算正样本和负样本的权重
-                    pos_weights_audio = torch.tensor(
-                        [F.cosine_similarity(anchor_dimension.unsqueeze(0), raw_audio_dimension[j].unsqueeze(0), dim=1)
-                         for j in positive_audio_indices])
-                    pos_weights_audio = 1.0 / (pos_weights_audio + 1e-8)
-                    pos_weights_audio = pos_weights_audio / pos_weights_audio.sum()
-
-                    neg_weights_audio = torch.tensor(
-                        [F.cosine_similarity(anchor_dimension.unsqueeze(0), raw_audio_dimension[j].unsqueeze(0), dim=1)
-                         for j in negative_audio_indices])
-                    neg_weights_audio = neg_weights_audio / neg_weights_audio.sum()
-
-                    pos_sum_audio = (pos_sim_audio * pos_weights_audio.to(device)).sum()
-                    neg_sum = (neg_sim_audio * neg_weights_audio.to(device)).sum() + neg_sim_text.sum()
-                    contrastive_loss += -torch.log(pos_sum_audio / (pos_sum_audio + neg_sum))
-
-            contrastive_loss1 = contrastive_loss / (2 * len(labels))
-
-            #######增强数据的对比学习
-
-            contrastive_loss = 0
-            temperature = temperature_model_init()  # 获取当前可学习的温度系数
-
-            for i in range(len(labels)):
-                anchor_audio_embedding = aug_audio_cls_embeddings[i]  # 不对增强数据的语音头进行映射
-                anchor_text_embedding =  projection_head_init (aug_text_cls_embeddings[i])  # 只对增强数据的文本头进行映射
-                anchor_label = labels[i]
-                anchor_dimension = aug_audio_dimension[i]
-
-                # 找出所有的正样本和负样本
-                positive_text_indices = (labels == anchor_label).nonzero(as_tuple=True)[0]
-                negative_text_indices = (labels != anchor_label).nonzero(as_tuple=True)[0]
-                positive_audio_indices = (labels == anchor_label).nonzero(as_tuple=True)[0]
-                negative_audio_indices = (labels != anchor_label).nonzero(as_tuple=True)[0]
-
-                positive_text_embeddings =  projection_head_init (
-                    aug_text_cls_embeddings[positive_text_indices])  # 只对增强数据的文本头进行映射
-                positive_audio_embeddings = aug_audio_cls_embeddings[positive_audio_indices]  # 不对增强数据的语音头进行映射
-                negative_text_embeddings =  projection_head_init (
-                    aug_text_cls_embeddings[negative_text_indices])  # 只对增强数据的文本头进行映射
-                negative_audio_embeddings = aug_audio_cls_embeddings[negative_audio_indices]  # 不对增强数据的语音头进行映射
-
-                # Audio anchor with Text
-                if len(positive_text_embeddings) > 1:
-                    pos_sim_text = torch.exp(
-                        F.cosine_similarity(anchor_audio_embedding.unsqueeze(0),
-                                            positive_text_embeddings) / temperature)
-                    neg_sim_text = torch.exp(
-                        F.cosine_similarity(anchor_audio_embedding.unsqueeze(0),
-                                            negative_text_embeddings) / temperature)
-                    neg_sim_audio = torch.exp(
-                        F.cosine_similarity(anchor_audio_embedding.unsqueeze(0),
-                                            negative_audio_embeddings) / temperature)
-
-                    # 计算正样本和负样本的权重
-                    pos_weights_text = torch.tensor(
-                        [F.cosine_similarity(anchor_dimension.unsqueeze(0), aug_audio_dimension[j].unsqueeze(0), dim=1)
-                         for j in  positive_text_indices])
-                    pos_weights_text = 1.0 / (pos_weights_text + 1e-8)
-                    pos_weights_text = pos_weights_text / pos_weights_text.sum()
-
-                    neg_weights_text = torch.tensor(
-                        [F.cosine_similarity(anchor_dimension.unsqueeze(0), aug_audio_dimension[j].unsqueeze(0), dim=1)
-                         for j in negative_text_indices])
-                    neg_weights_text = neg_weights_text / neg_weights_text.sum()
-
-                    pos_sum_text = (pos_sim_text * pos_weights_text.to(device)).sum()
-                    neg_sum = (neg_sim_text * neg_weights_text.to(device)).sum() + neg_sim_audio.sum()
-                    contrastive_loss += -torch.log(pos_sum_text / (pos_sum_text + neg_sum))
-
-                # Text anchor with Audio
-                if len(positive_audio_embeddings) > 1:
-                    pos_sim_audio = torch.exp(
-                        F.cosine_similarity(anchor_text_embedding.unsqueeze(0),
-                                            positive_audio_embeddings) / temperature)
-                    neg_sim_audio = torch.exp(
-                        F.cosine_similarity(anchor_text_embedding.unsqueeze(0),
-                                            negative_audio_embeddings) / temperature)
-                    neg_sim_text = torch.exp(
-                        F.cosine_similarity(anchor_text_embedding.unsqueeze(0), negative_text_embeddings) / temperature)
-
-                    # 计算正样本和负样本的权重
-                    pos_weights_audio = torch.tensor(
-                        [F.cosine_similarity(anchor_dimension.unsqueeze(0), aug_audio_dimension[j].unsqueeze(0), dim=1) for j in
-                         positive_audio_indices])
-                    pos_weights_audio = 1.0 / (pos_weights_audio + 1e-8)
-                    pos_weights_audio = pos_weights_audio / pos_weights_audio.sum()
-
-                    neg_weights_audio = torch.tensor(
-                        [F.cosine_similarity(anchor_dimension.unsqueeze(0), aug_audio_dimension[j].unsqueeze(0), dim=1) for j in
-                         negative_audio_indices])
-                    neg_weights_audio = neg_weights_audio / neg_weights_audio.sum()
-
-                    pos_sum_audio = (pos_sim_audio * pos_weights_audio.to(device)).sum()
-                    neg_sum = (neg_sim_audio * neg_weights_audio.to(device)).sum() + neg_sim_text.sum()
-                    contrastive_loss += -torch.log(pos_sum_audio / (pos_sum_audio + neg_sum))
-
-            contrastive_loss2 = contrastive_loss / (2 * len(labels))
-
-            contrastive_loss = (contrastive_loss1 + contrastive_loss2) / 2
-
-            binary_pairs, binary_pairs_masks, binary_pair_labels = create_binary_classification_pairs(
-                raw_audio_seq_embedding, raw_audio_attention_masks, raw_text_seq_embedding, labels)
+            # Fuse modalities and compute classification logits
+            logits, binary_logits, fusion_Cls = Bert_adapter_multimodel_fusion_init(raw_audio_seq_embedding, raw_text_seq_embedding)
+            # Compute classification loss
+            classification_loss = classification_criterion(logits, labels.to(device))
+            ###创建二分类任务
+            binary_pairs,  binary_pair_labels = create_binary_classification_pairs(raw_audio_seq_embedding, raw_text_seq_embedding, labels)
             binary_pairs_audio = torch.stack([pair[0] for pair in binary_pairs]).to(device)
             binary_pairs_text = torch.stack([pair[1] for pair in binary_pairs]).to(device)
             binary_pair_labels = torch.tensor(binary_pair_labels).to(device)
-            binary_pairs_masks = torch.stack(binary_pairs_masks).to(device)
-
-            binary_attention_mask, binary_token_type_ids = create_attention_mask_and_token_type_ids_for_binary(
-                binary_pairs_audio, binary_pairs_masks, binary_pairs_text, max_length=2800)
-            binary_logits = Bert_adapter_multimodel_fusion_init(binary_pairs_audio, binary_pairs_text, binary_attention_mask,
-                                                           binary_token_type_ids)[1]
-            binary_classification_loss1 = classification_criterion(binary_logits, binary_pair_labels)
-
-            binary_classification_loss = binary_classification_loss1
-
-            loss = 0.2 * contrastive_loss + 0.5 * classification_loss + 0.3 * binary_classification_loss
-            optimizer.zero_grad()
+            _, binary_logits, _ = Bert_adapter_multimodel_fusion_init(binary_pairs_audio,binary_pairs_text)
+            binary_classification_loss = classification_criterion(binary_logits, binary_pair_labels)
+            # Total loss
+            loss = 0.2*text_contrastive_loss + 0.2*audio_contrastive_loss + 0.4*classification_loss + 0.2*binary_classification_loss+0.2*modal_contrastive_loss
             loss.backward()
             optimizer.step()
+            total_loss += loss.item()
 
-        accuracy, avg_loss, weighted_accuracy, class_accuracy, class_weights = evaluate_model(TextEmbedding_model_init,
-                                                                                              Bert_adapter_multimodel_fusion_init,
-                                                                                              val_dataloader)
-        print(
-            f"Session {session_id} Epoch {epoch + 1}/{num_epochs}, Validation Accuracy: {accuracy:.4f}, Validation Loss: {avg_loss:.4f}, Weighted Accuracy: {weighted_accuracy:.4f}")
-        for i in range(num_labels):
-            print(f"Class {i} Accuracy: {class_accuracy[i]:.4f}, Weight: {class_weights[i]:.4f}")
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss / len(train_dataloader):.4f}")
 
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-
-            print(f"New best model saved with accuracy: {best_accuracy:.4f}")
+        # Evaluate model
+        accuracy, avg_loss, weighted_accuracy, class_accuracy, class_weights = evaluate_model(
+            TextEmbedding_model_init, audio_model, Bert_adapter_multimodel_fusion_init, val_dataloader
+        )
+        print(f"Validation Results - Epoch {epoch + 1}")
+        print(f"Accuracy: {accuracy:.4f}, Average Loss: {avg_loss:.4f}, Weighted Accuracy: {weighted_accuracy:.4f}")
+        print(f"Class-wise Accuracy: {class_accuracy}")
