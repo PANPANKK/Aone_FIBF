@@ -163,18 +163,19 @@ class RegressionHead(nn.Module):
 ###  如果想要取出，hidden_states的非池化结果，即维度为[batch, seq_len, 1024],只需要取出 hidden_states0 = outputs[0]
 class EmotionModel(Wav2Vec2PreTrainedModel):
     r"""Speech emotion classifier."""
-
     def __init__(self, config):
         super().__init__(config)
         self.config = config
         self.wav2vec2 = Wav2Vec2Model(config)
         self.classifier = RegressionHead(config)
         self.init_weights()
+
     def forward(
             self,
             input_values,
+            attention_mask=None,  # 添加 attention_mask 参数
     ):
-        outputs = self.wav2vec2(input_values)
+        outputs = self.wav2vec2(input_values, attention_mask=attention_mask)  # 将 attention_mask 传递给 wav2vec2
         hidden_states0 = outputs[0]
         hidden_states1 = torch.mean(hidden_states0, dim=1)
         logits = self.classifier(hidden_states1)
@@ -190,8 +191,6 @@ def process_func(x: np.ndarray, sampling_rate: int) -> np.ndarray:
     with torch.no_grad():
         y = audio_model(y)
     return y[0],y[1],y[2]
-
-
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model_name = '../wav2vec2-large-uncased'
